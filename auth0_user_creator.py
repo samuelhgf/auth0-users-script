@@ -5,6 +5,7 @@ import json
 import requests
 import sys
 import base64
+import os
 
 
 def decode_jwt_payload(token):
@@ -43,6 +44,60 @@ def extract_api_url_from_token(token):
     
     # Return the full aud value
     return aud
+
+
+def get_roles(auth0_token, api_url, debug=False):
+    """Fetch all roles from Auth0."""
+    headers = {
+        "Authorization": f"Bearer {auth0_token}",
+        "Content-Type": "application/json"
+    }
+    
+    roles_url = f"{api_url}roles"
+    
+    if debug:
+        print("\n=== DEBUG: Roles Fetch Request ===")
+        print(f"URL: {roles_url}")
+        print(f"Headers: {json.dumps(headers, indent=2)}")
+        # Mock a successful response for debug mode
+        mock_roles = [
+            {"id": "rol_1", "name": "Admin", "description": "Administrator role"},
+            {"id": "rol_2", "name": "User", "description": "Regular user role"},
+            {"id": "rol_3", "name": "Editor", "description": "Content editor role"}
+        ]
+        print(f"Mock Response: {json.dumps(mock_roles, indent=2)}")
+        return mock_roles
+    else:
+        roles_response = requests.get(roles_url, headers=headers)
+        
+        if roles_response.status_code != 200:
+            print(f"Failed to fetch roles: {roles_response.text}")
+            sys.exit(1)
+        
+        return roles_response.json()
+
+
+def prompt_role_selection(roles):
+    """Display available roles and prompt user to select one."""
+    print("\nAvailable Roles:")
+    print("----------------")
+    for idx, role in enumerate(roles, 1):
+        description = role.get('description', 'No description')
+        print(f"{idx}. {role['name']} - {description} (ID: {role['id']})")
+    
+    while True:
+        try:
+            selection = input("\nSelect a role (enter number): ")
+            selection_idx = int(selection) - 1
+            
+            if 0 <= selection_idx < len(roles):
+                selected_role = roles[selection_idx]
+                print(f"\nSelected role: {selected_role['name']} (ID: {selected_role['id']})")
+                return selected_role['id']
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {len(roles)}.")
+        except ValueError:
+            print("Please enter a valid number.")
 
 
 def create_user(auth0_token, email, role_id, api_url, debug=False):
@@ -131,13 +186,48 @@ def create_user(auth0_token, email, role_id, api_url, debug=False):
         }
 
 
+def save_results(results, output_file):
+    """Save results to the output file, appending if possible."""
+    existing_data = []
+    
+    # Check if file exists and try to read existing content
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                existing_data = json.load(f)
+                if not isinstance(existing_data, list):
+                    print(f"Warning: Existing file {output_file} does not contain a valid JSON array. Overwriting.")
+                    existing_data = []
+        except json.JSONDecodeError:
+            print(f"Warning: Existing file {output_file} does not contain valid JSON. Overwriting.")
+        except Exception as e:
+            print(f"Warning: Error reading existing file {output_file}: {str(e)}. Overwriting.")
+    
+    # Combine existing data with new results
+    if isinstance(existing_data, list):
+        combined_data = existing_data + results
+    else:
+        combined_data = results
+    
+    # Write the combined data
+    with open(output_file, 'w') as f:
+        json.dump(combined_data, f, indent=2)
+    
+    if len(existing_data) > 0:
+        print(f"Appended {len(results)} new results to existing {len(existing_data)} results in {output_file}")
+    else:
+        print(f"Saved {len(results)} results to {output_file}")
+    
+    return len(combined_data)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Create Auth0 users with incremental emails")
     parser.add_argument("--token", required=True, help="Auth0 Management API token")
     parser.add_argument("--email", required=True, help="Email template with {$} placeholder")
     parser.add_argument("--start", type=int, required=True, help="Starting number for email replacement")
     parser.add_argument("--end", type=int, required=True, help="Ending number for email replacement")
-    parser.add_argument("--role-id", required=True, help="Role ID to assign to users")
+    parser.add_argument("--role-id", help="Role ID to assign to users (optional, will prompt if not provided)")
     parser.add_argument("--output", default="auth0_users.json", help="Output file for successful responses")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode without making actual API calls")
     
@@ -158,6 +248,12 @@ def main():
         print("Error: Start number must be less than or equal to end number")
         sys.exit(1)
     
+    # Get role ID - either from command line or by fetching and prompting
+    role_id = args.role_id
+    if not role_id:
+        roles = get_roles(args.token, api_url, args.debug)
+        role_id = prompt_role_selection(roles)
+    
     results = []
     
     try:
@@ -165,7 +261,7 @@ def main():
             email = args.email.replace("{$}", str(num))
             print(f"Creating user with email: {email}")
             
-            response = create_user(args.token, email, args.role_id, api_url, args.debug)
+            response = create_user(args.token, email, role_id, api_url, args.debug)
             
             if response["success"]:
                 user_id = response["user"]["user_id"]
@@ -175,16 +271,13 @@ def main():
                 print(f"  ✗ Error: {response['error']}")
                 # Save successful results before exiting
                 if results:
-                    with open(args.output, "w") as f:
-                        json.dump(results, f, indent=2)
-                    print(f"Saved {len(results)} successful results to {args.output}")
+                    total_saved = save_results(results, args.output)
                 sys.exit(1)
         
         # Save all successful results
         if results:
-            with open(args.output, "w") as f:
-                json.dump(results, f, indent=2)
-            print(f"Successfully created {len(results)} users. Results saved to {args.output}")
+            total_saved = save_results(results, args.output)
+            print(f"Successfully created {len(results)} users. Total users in output file: {total_saved}")
             if args.debug:
                 print("\nNOTE: Since this was run in debug mode, no actual users were created.")
         
@@ -192,9 +285,7 @@ def main():
         print(f"Unexpected error: {str(e)}")
         # Save successful results before exiting
         if results:
-            with open(args.output, "w") as f:
-                json.dump(results, f, indent=2)
-            print(f"Saved {len(results)} successful results to {args.output}")
+            save_results(results, args.output)
         sys.exit(1)
 
 
